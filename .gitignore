@@ -1,0 +1,21 @@
+# Virtual environments
+venv/
+venv_paddle/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ML models & repos (large files - download separately)
+swinir_repo/
+swinir_weights.pth
+docscanner_repo/
+bedsr_repo/
+models/
+
+# OS
+.DS_Store
+
+# Results (generated)
+results/
