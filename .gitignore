@@ -17,5 +17,6 @@ models/
 # OS
 .DS_Store
 
-# Results (generated)
-results/
+# TAIR
+tair_repo/
+venv_tair/
