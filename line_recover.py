@@ -839,12 +839,55 @@ def mod_dewarp(img_cv, **kwargs):
     return img_cv
 
 
+def mod_restore(img_cv, **kwargs):
+    """[restore 모듈] TAIR 기반 텍스트 인식 글씨 복원 (Diffusion).
+
+    venv_tair의 TAIR(TeReDiff)를 서브프로세스로 호출.
+    저화질/흐릿한 문서의 글씨를 선명하게 복원.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    tair_python = os.path.join(script_dir, "venv_tair", "bin", "python3")
+    tair_script = os.path.join(script_dir, "tair_restore.py")
+
+    if not os.path.exists(tair_python):
+        print("    venv_tair 없음, restore 스킵")
+        return img_cv
+
+    tmp_in = tempfile.mktemp(suffix=".png")
+    tmp_out = tempfile.mktemp(suffix=".png")
+    cv2.imwrite(tmp_in, img_cv)
+
+    try:
+        env = os.environ.copy()
+        env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        result = subprocess.run(
+            [tair_python, tair_script, tmp_in, tmp_out, "--steps", "15"],
+            capture_output=True, text=True, timeout=300, env=env
+        )
+        if result.returncode == 0 and os.path.exists(tmp_out):
+            restored = cv2.imread(tmp_out)
+            if restored is not None:
+                h, w = restored.shape[:2]
+                print("    TAIR 글씨복원 완료: {}x{}".format(w, h))
+                return restored
+        print("    restore 실패: {}".format(result.stderr.strip()[-200:]))
+    except subprocess.TimeoutExpired:
+        print("    restore 타임아웃 (300초 초과)")
+    finally:
+        for f in [tmp_in, tmp_out]:
+            if os.path.exists(f):
+                os.unlink(f)
+
+    return img_cv
+
+
 MODULES = {
     "perspective": mod_perspective,
     "rotate": mod_rotate,
     "deskew": mod_deskew,
     "dewarp": mod_dewarp,
     "shadow_remove": mod_shadow_remove,
+    "restore": mod_restore,
     "enhance": mod_enhance,
     "crop": mod_crop,
 }
