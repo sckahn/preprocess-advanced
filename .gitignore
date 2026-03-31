@@ -20,3 +20,10 @@ models/
 # TAIR
 tair_repo/
 venv_tair/
+
+# 생성된 데이터셋 (용량 큼 - GPU 서버에서 재생성)
+dataset/
+dataset_val/
+dataset_sample/
+dataset_val_sample/
+checkpoints/

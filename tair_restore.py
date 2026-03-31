@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""TAIR 기반 텍스트 인식 이미지 복원. venv_tair에서 실행.
+"""TAIR 타일 기반 글씨복원. venv_tair에서 실행.
 
-SwinIR(전처리) + ControlLDM(Stable Diffusion 2.1 기반 복원)으로
-저화질/흐릿한 문서 이미지의 글씨를 복원한다.
-testr(텍스트 스팟팅) 없이 이미지 복원만 수행하는 경량 버전.
+이미지를 128x128 타일로 분할 → 각각 TAIR 복원(512x512, 4x) → 합성.
+TAIR 공식 로직: LQ 128 → resize 512 → SwinIR → ControlLDM Diffusion → 512 HQ
 
-사용법: python3 tair_restore.py input.png output.png [--steps 25]
+사용법: python3 tair_restore.py input.png output.png [--steps 50]
 """
 import os
 import sys
@@ -20,63 +19,51 @@ import numpy as np
 import cv2
 from PIL import Image
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 from terediff.model import ControlLDM, Diffusion
 from terediff.model.swinir import SwinIR
 from terediff.sampler import SpacedSampler
 from terediff.utils.common import instantiate_from_config
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 
 def load_models(device, weights_dir=None):
-    """SwinIR + ControlLDM 모델 로드."""
     if weights_dir is None:
         weights_dir = os.path.join(TAIR_DIR, "weights")
 
     cfg_path = os.path.join(TAIR_DIR, "configs", "val", "val_terediff.yaml")
     cfg = OmegaConf.load(cfg_path)
 
-    # SwinIR 로드
+    # SwinIR
     swinir = instantiate_from_config(cfg.model.swinir)
-    swinir_path = os.path.join(weights_dir, "realesrgan_s4_swinir_100k.pth")
-    sd = torch.load(swinir_path, map_location="cpu")
+    sd = torch.load(os.path.join(weights_dir, "realesrgan_s4_swinir_100k.pth"), map_location="cpu")
     if "state_dict" in sd:
         sd = sd["state_dict"]
     sd = {(k[len("module."):] if k.startswith("module.") else k): v for k, v in sd.items()}
     swinir.load_state_dict(sd, strict=True)
     swinir.requires_grad_(False)
-    swinir.to(device)
-    print("SwinIR loaded")
 
-    # ControlLDM 로드
+    # ControlLDM
     cldm = instantiate_from_config(cfg.model.cldm)
-    sd_path = os.path.join(weights_dir, "sd2.1-base-zsnr-laionaes5.ckpt")
-    sd_weights = torch.load(sd_path, map_location="cpu")["state_dict"]
+    sd_weights = torch.load(os.path.join(weights_dir, "sd2.1-base-zsnr-laionaes5.ckpt"), map_location="cpu")["state_dict"]
     cldm.load_pretrained_sd(sd_weights)
+    cldm.load_controlnet_from_ckpt(torch.load(os.path.join(weights_dir, "DiffBIR_v2.1.pt"), map_location="cpu"))
 
-    resume_path = os.path.join(weights_dir, "DiffBIR_v2.1.pt")
-    if os.path.exists(resume_path):
-        cldm.load_controlnet_from_ckpt(torch.load(resume_path, map_location="cpu"))
-        print("ControlNet loaded")
-    else:
-        cldm.load_controlnet_from_unet()
-        print("ControlNet: using SD default weights")
-
-    # TeReDiff stage3 checkpoint
+    # TeReDiff stage3
     stage3_path = os.path.join(weights_dir, "TAIR", "terediff_stage3.pt")
     if os.path.exists(stage3_path):
         ckpt = torch.load(stage3_path, map_location="cpu")
         if "cldm" in ckpt:
             cldm.load_state_dict(ckpt["cldm"], strict=False)
-            print("TeReDiff stage3 cldm loaded")
         if "swinir" in ckpt:
             swinir.load_state_dict(ckpt["swinir"], strict=False)
-            print("TeReDiff stage3 swinir loaded")
+        print("TeReDiff stage3 loaded")
 
-    cldm.requires_grad_(False)
-    cldm.to(device)
+    swinir.eval().to(device)
+    cldm.eval().requires_grad_(False).to(device)
 
-    # Diffusion
     diffusion = instantiate_from_config(cfg.model.diffusion)
     diffusion.to(device)
     sampler = SpacedSampler(diffusion.betas, diffusion.parameterization, rescale_cfg=False)
@@ -84,31 +71,21 @@ def load_models(device, weights_dir=None):
     return swinir, cldm, sampler
 
 
+# LQ 전처리: 128x128 → 512x512, [0,1]
+PREPROCESS_LQ = T.Compose([
+    T.Resize(size=(512, 512), interpolation=T.InterpolationMode.BICUBIC),
+    T.ToTensor()
+])
+
+
 @torch.no_grad()
-def restore_image(img_cv, swinir, cldm, sampler, device, steps=25):
-    """단일 이미지 복원."""
-    h_orig, w_orig = img_cv.shape[:2]
-
-    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    img_pil = Image.fromarray(img_rgb)
-
-    preprocess = T.Compose([
-        T.Resize((512, 512), interpolation=T.InterpolationMode.BICUBIC),
-        T.ToTensor(),
-    ])
-    img_tensor = preprocess(img_pil).unsqueeze(0).to(device)
-
-    # SwinIR: 512x512 input (unshuffle 8x internally)
-    clean = swinir(img_tensor)
-    clean = clean.clamp(0, 1)
-
-    # ControlLDM
-    clean_norm = clean * 2 - 1
-    cond = cldm.prepare_condition(clean_norm, [""])
+def restore_tile(tile_pil, swinir, cldm, sampler, device, steps):
+    """128x128 PIL 타일 → 512x512 numpy HQ."""
+    val_lq = PREPROCESS_LQ(tile_pil).unsqueeze(0).to(device)
+    val_clean = swinir(val_lq)
+    val_cond = cldm.prepare_condition(val_clean, [""])
 
     pure_noise = torch.randn((1, 4, 64, 64), device=device)
-
-    # Diffusion sampling (without testr, direct loop)
     sampler.make_schedule(steps)
     sampler.to(device)
 
@@ -119,43 +96,94 @@ def restore_image(img_cv, swinir, cldm, sampler, device, steps=25):
     for i, current_timestep in enumerate(timesteps):
         model_t = torch.full((1,), current_timestep, device=device, dtype=torch.long)
         t = torch.full((1,), total_steps - i - 1, device=device, dtype=torch.long)
-        cur_cfg_scale = sampler.get_cfg_scale(1.0, current_timestep)
-        x, _ = sampler.p_sample(cldm, x, model_t, t, cond, None, cur_cfg_scale)
+        x, _ = sampler.p_sample(cldm, x, model_t, t, val_cond, None,
+                                sampler.get_cfg_scale(1.0, current_timestep))
 
-    z = x
-    restored = cldm.vae_decode(z)
-    restored = torch.clamp((restored + 1) / 2, 0, 1)
+    restored = torch.clamp((cldm.vae_decode(x) + 1) / 2, 0, 1)
+    return restored[0].permute(1, 2, 0).cpu().numpy()  # 512x512x3, [0,1]
 
-    restored_np = (restored[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-    restored_bgr = cv2.cvtColor(restored_np, cv2.COLOR_RGB2BGR)
 
-    if (h_orig, w_orig) != (512, 512):
-        restored_bgr = cv2.resize(restored_bgr, (w_orig, h_orig), interpolation=cv2.INTER_CUBIC)
+def restore_image(input_path, output_path, swinir, cldm, sampler, device, steps):
+    """이미지를 128x128 타일로 분할 → TAIR 복원(4x) → 합성."""
+    img = cv2.imread(input_path)
+    h, w = img.shape[:2]
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    return restored_bgr
+    LQ = 128
+    HQ = 512
+    SCALE = HQ // LQ  # 4
+    OVERLAP = 16  # LQ 기준
+
+    h_out, w_out = h * SCALE, w * SCALE
+    step = LQ - OVERLAP
+
+    output = np.zeros((h_out, w_out, 3), dtype=np.float64)
+    weight = np.zeros((h_out, w_out, 1), dtype=np.float64)
+
+    # 블렌딩 가중치
+    blend = np.ones((HQ, HQ, 1), dtype=np.float64)
+    ramp_len = OVERLAP * SCALE
+    ramp = np.linspace(0, 1, ramp_len)
+    for i in range(ramp_len):
+        blend[i, :, 0] *= ramp[i]
+        blend[-(i + 1), :, 0] *= ramp[i]
+        blend[:, i, 0] *= ramp[i]
+        blend[:, -(i + 1), 0] *= ramp[i]
+
+    # 타일 좌표 계산
+    tiles = []
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            y1 = min(y, max(0, h - LQ))
+            x1 = min(x, max(0, w - LQ))
+            tiles.append((y1, x1))
+    # 중복 제거
+    tiles = list(dict.fromkeys(tiles))
+
+    print("  tiles: {} ({}x{} -> {}x{})".format(len(tiles), w, h, w_out, h_out))
+
+    for idx, (y1, x1) in enumerate(tqdm(tiles, desc="  TAIR")):
+        y2 = min(y1 + LQ, h)
+        x2 = min(x1 + LQ, w)
+        th, tw = y2 - y1, x2 - x1
+
+        # 128x128 패딩 (빈 부분은 흰색)
+        tile = np.full((LQ, LQ, 3), 255, dtype=np.uint8)
+        tile[:th, :tw] = img_rgb[y1:y2, x1:x2]
+        tile_pil = Image.fromarray(tile)
+
+        # TAIR 복원 → 512x512
+        result = restore_tile(tile_pil, swinir, cldm, sampler, device, steps)
+
+        # 출력 좌표
+        oy1, ox1 = y1 * SCALE, x1 * SCALE
+        oth, otw = th * SCALE, tw * SCALE
+
+        # 블렌딩
+        w_tile = blend[:oth, :otw]
+        output[oy1:oy1 + oth, ox1:ox1 + otw] += result[:oth, :otw] * w_tile
+        weight[oy1:oy1 + oth, ox1:ox1 + otw] += w_tile
+
+    output /= np.maximum(weight, 1e-8)
+    output = (output * 255).clip(0, 255).astype(np.uint8)
+    output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+
+    cv2.imwrite(output_path, output)
+    print("  OK {}x{} -> {}x{}".format(w, h, w_out, h_out))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TAIR text-aware image restoration")
-    parser.add_argument("input", help="input image path")
-    parser.add_argument("output", help="output image path")
-    parser.add_argument("--steps", type=int, default=25, help="diffusion sampling steps (default: 25)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input")
+    parser.add_argument("output")
+    parser.add_argument("--steps", type=int, default=50)
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print("Device:", device)
 
     swinir, cldm, sampler = load_models(device)
-
-    img = cv2.imread(args.input)
-    if img is None:
-        print("Failed to read:", args.input)
-        sys.exit(1)
-
-    print("Input: {}x{}".format(img.shape[1], img.shape[0]))
-    restored = restore_image(img, swinir, cldm, sampler, device, steps=args.steps)
-    cv2.imwrite(args.output, restored)
-    print("Output: {}x{} -> {}".format(restored.shape[1], restored.shape[0], args.output))
+    restore_image(args.input, args.output, swinir, cldm, sampler, device, args.steps)
 
 
 if __name__ == "__main__":
